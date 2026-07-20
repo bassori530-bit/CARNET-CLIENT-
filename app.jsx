@@ -15,6 +15,8 @@ import {
   CheckCircle2,
   CircleDot,
   Pencil,
+  Settings,
+  KeyRound,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -195,6 +197,9 @@ export default function CarnetClient() {
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [confirmingId, setConfirmingId] = useState(null);
   const [detail, setDetail] = useState(null); // {loading, record, id}
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
 
   const chunkMapRef = useRef({}); // id -> chunk index
   const metaRef = useRef({ chunkCount: 0 });
@@ -240,6 +245,36 @@ export default function CarnetClient() {
       }
     })();
   }, []);
+
+  // -- Chargement de la clé API personnelle (stockée sur l'appareil) -------
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("settings-anthropic-key", false);
+        if (res && res.value) {
+          setApiKey(res.value);
+          setApiKeyDraft(res.value);
+        }
+      } catch {
+        // pas de clé enregistrée
+      }
+    })();
+  }, []);
+
+  const saveApiKey = async () => {
+    const trimmed = apiKeyDraft.trim();
+    setApiKey(trimmed);
+    try {
+      if (trimmed) {
+        await window.storage.set("settings-anthropic-key", trimmed, false);
+      } else {
+        await window.storage.delete("settings-anthropic-key", false);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+    setShowSettings(false);
+  };
 
   // -- Helpers de stockage par blocs ---------------------------------------
   const persistNewIndexRecord = async (record) => {
@@ -302,12 +337,23 @@ export default function CarnetClient() {
   };
 
   const analyzeScreenshot = useCallback(async (img) => {
+    if (!apiKey) {
+      setAnalyzeError(
+        "Aucune clé API configurée. Ouvre les réglages (icône ⚙ en haut) pour l'ajouter, ou renseigne les champs manuellement."
+      );
+      return;
+    }
     setAnalyzing(true);
     setAnalyzeError("");
     try {
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
         body: JSON.stringify({
           model: "claude-sonnet-4-6",
           max_tokens: 1000,
@@ -337,7 +383,11 @@ export default function CarnetClient() {
           ],
         }),
       });
-      if (!response.ok) throw new Error(`Erreur API (${response.status})`);
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => null);
+        const msg = errBody?.error?.message || `Erreur API (${response.status})`;
+        throw new Error(msg);
+      }
       const data = await response.json();
       const text = (data.content || [])
         .map((b) => (b.type === "text" ? b.text : ""))
@@ -357,11 +407,13 @@ export default function CarnetClient() {
       );
     } catch (err) {
       console.error(err);
-      setAnalyzeError("Analyse impossible. Renseigne les champs manuellement ci-dessous.");
+      setAnalyzeError(
+        `Analyse impossible (${err.message || "erreur inconnue"}). Renseigne les champs manuellement ci-dessous.`
+      );
     } finally {
       setAnalyzing(false);
     }
-  }, []);
+  }, [apiKey]);
 
   const handleScreenshotPick = (img) => {
     setDraft((prev) => ({ ...prev, screenshot: img }));
@@ -537,6 +589,9 @@ export default function CarnetClient() {
         .brand-title { font-size: 21px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
         .new-btn { display: flex; align-items: center; gap: 6px; background: var(--ink); color: var(--paper); border: none; border-radius: 10px; padding: 10px 14px; font-weight: 600; font-size: 13.5px; cursor: pointer; transition: transform 0.12s ease, background 0.15s ease; flex-shrink: 0; }
         .new-btn:hover { background: #14203a; } .new-btn:active { transform: scale(0.96); }
+        .topbar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+        .settings-btn { display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 10px; border: 1.5px solid var(--line-strong); background: #fff; color: var(--ink-soft); cursor: pointer; flex-shrink: 0; }
+        .settings-btn:hover { background: rgba(30,42,68,0.05); color: var(--ink); }
         .content { max-width: 600px; margin: 0 auto; padding: 20px; }
 
         .panel { background: var(--paper-raised); border: 1px solid var(--line); border-radius: 16px; padding: 20px; margin-bottom: 28px; box-shadow: 0 1px 2px rgba(30,42,68,0.04), 0 8px 24px -12px rgba(30,42,68,0.12); animation: rise 0.22s ease; }
@@ -646,6 +701,8 @@ export default function CarnetClient() {
         .modal-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; gap: 10px; }
         .modal-head h2 { font-size: 18px; margin: 0 0 4px; font-weight: 700; }
         .modal-sub { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 800; color: var(--ink); }
+        .modal-sub-plain { font-size: 12.5px; color: var(--ink-soft); }
+        .settings-hint { font-size: 12px; color: var(--ink-soft); line-height: 1.5; margin: 2px 0 4px; }
         .modal-imgs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 0; }
         .modal-imgs img { width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: 10px; border: 1px solid var(--line); }
         .modal-fields { display: flex; flex-direction: column; gap: 9px; margin: 14px 0; }
@@ -672,10 +729,22 @@ export default function CarnetClient() {
             <h1 className="brand-title">Carnet Client</h1>
           </div>
           {!draft && (
-            <button className="new-btn" onClick={openNew}>
-              <Plus size={16} strokeWidth={2.4} />
-              Créer
-            </button>
+            <div className="topbar-actions">
+              <button
+                className="settings-btn"
+                onClick={() => {
+                  setApiKeyDraft(apiKey);
+                  setShowSettings(true);
+                }}
+                aria-label="Réglages"
+              >
+                <Settings size={17} strokeWidth={2} />
+              </button>
+              <button className="new-btn" onClick={openNew}>
+                <Plus size={16} strokeWidth={2.4} />
+                Créer
+              </button>
+            </div>
           )}
         </div>
       </header>
@@ -1037,6 +1106,52 @@ export default function CarnetClient() {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {showSettings && (
+        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <div>
+                <h2>Réglages</h2>
+                <div className="modal-sub-plain">Analyse automatique des captures</div>
+              </div>
+              <button className="panel-close" onClick={() => setShowSettings(false)} aria-label="Fermer">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="field mono">
+              <label>
+                <KeyRound size={12} style={{ verticalAlign: "-2px", marginRight: 4 }} />
+                Clé API Anthropic
+              </label>
+              <input
+                type="password"
+                placeholder="sk-ant-..."
+                value={apiKeyDraft}
+                onChange={(e) => setApiKeyDraft(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+            <p className="settings-hint">
+              Nécessaire pour que le bouton « Capture d'écran » remplisse automatiquement les
+              champs. La clé est enregistrée uniquement sur cet appareil et n'est jamais envoyée
+              ailleurs qu'à l'API Anthropic. Laisse le champ vide pour désactiver l'analyse
+              automatique.
+            </p>
+
+            <div className="panel-actions">
+              <button className="btn-cancel" onClick={() => setShowSettings(false)}>
+                Annuler
+              </button>
+              <button className="btn-save" onClick={saveApiKey}>
+                <Save size={15} strokeWidth={2.2} />
+                Enregistrer
+              </button>
+            </div>
           </div>
         </div>
       )}
