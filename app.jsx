@@ -35,11 +35,10 @@ const EMPTY_DRAFT = () => ({
   nom: "",
   numero: "",
   lieu: "",
-  pointure: "",
   detailsArticle: "",
   statut: "en_cours",
   screenshot: null,
-  articlePhotos: [],
+  articlePhotos: [], // { data, mediaType, pointure }
   dateHeure: toLocalInputValue(new Date()),
 });
 
@@ -84,62 +83,18 @@ function safeParse(json, fallback) {
   }
 }
 
-// Extraction approximative des champs à partir du texte brut lu par l'OCR.
-// Basée sur des mots-clés courants ; à vérifier/corriger manuellement.
-function extractFieldsFromOCR(rawText) {
-  const lines = rawText
+// Le texte lu par l'OCR est brut (conversation de chat, pas un formulaire) :
+// deviner nom / numéro / lieu / pointure à partir de mots-clés produit trop
+// de fausses correspondances. On se contente donc de nettoyer le texte brut
+// pour le déposer dans « Détails article » : c'est ensuite l'utilisateur qui
+// copie ce dont il a besoin dans les bons champs.
+function cleanOcrText(rawText) {
+  return rawText
     .split(/\r?\n/)
     .map((l) => l.trim())
-    .filter(Boolean);
-  const joined = rawText.replace(/\s+/g, " ");
-
-  const findAfterLabel = (labelPatterns) => {
-    for (const pattern of labelPatterns) {
-      const re = new RegExp(pattern + "\\s*[:\\-]?\\s*(.+)", "i");
-      for (const line of lines) {
-        const m = line.match(re);
-        if (m && m[1] && m[1].trim().length > 1) return m[1].trim();
-      }
-    }
-    return "";
-  };
-
-  const nom = findAfterLabel(["client", "destinataire", "nom du client", "nom", "livr[ée] [àa]"]);
-
-  let numero = findAfterLabel([
-    "n[°o]\\s*de commande",
-    "commande n[°o]",
-    "num[ée]ro de suivi",
-    "num[ée]ro de commande",
-    "num[ée]ro de colis",
-    "tracking",
-    "colis n[°o]",
-    "cmd",
-    "num[ée]ro",
-  ]);
-  if (!numero) {
-    const m = joined.match(/\b([A-Z]{2,}-?\d{4,}|\d{6,})\b/);
-    if (m) numero = m[1];
-  }
-
-  const lieu = findAfterLabel([
-    "lieu de livraison",
-    "adresse de livraison",
-    "livraison [àa]",
-    "exp[ée]di[ée] [àa]",
-    "adresse",
-    "ville",
-    "destination",
-    "lieu",
-  ]);
-
-  let pointure = findAfterLabel(["pointure", "taille", "size", "eu\\s*size"]);
-  if (!pointure) {
-    const m = joined.match(/\b(3[4-9]|4[0-8])\b/);
-    if (m) pointure = m[1];
-  }
-
-  return { nom, numero, lieu, pointure };
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 }
 
 function UploadTile({ label, hint, icon: Icon, image, onPick, onClear, accent }) {
@@ -193,25 +148,34 @@ function UploadTile({ label, hint, icon: Icon, image, onPick, onClear, accent })
   );
 }
 
-function PhotosField({ label, hint, icon: Icon, images, onAdd, onRemove, accent }) {
+function PhotosField({ label, hint, icon: Icon, images, onAdd, onRemove, onPointureChange, accent }) {
   return (
     <div className="photos-field">
       <div className="photos-field-label">{label}</div>
       <div className="photos-grid">
         {images.map((img, idx) => (
-          <div className="photo-thumb" key={idx}>
-            <img
-              src={`data:${img.mediaType};base64,${img.data}`}
-              alt={`${label} ${idx + 1}`}
+          <div className="photo-thumb-wrap" key={idx}>
+            <div className="photo-thumb">
+              <img
+                src={`data:${img.mediaType};base64,${img.data}`}
+                alt={`${label} ${idx + 1}`}
+              />
+              <button
+                type="button"
+                className="photo-thumb-clear"
+                onClick={() => onRemove(idx)}
+                aria-label="Retirer la photo"
+              >
+                <X size={12} strokeWidth={2.4} />
+              </button>
+            </div>
+            <input
+              type="text"
+              className="photo-pointure-input"
+              placeholder="Pointure"
+              value={img.pointure || ""}
+              onChange={(e) => onPointureChange(idx, e.target.value)}
             />
-            <button
-              type="button"
-              className="photo-thumb-clear"
-              onClick={() => onRemove(idx)}
-              aria-label="Retirer la photo"
-            >
-              <X size={12} strokeWidth={2.4} />
-            </button>
           </div>
         ))}
         <label className="photo-add-tile" style={{ borderColor: accent }}>
@@ -227,7 +191,7 @@ function PhotosField({ label, hint, icon: Icon, images, onAdd, onRemove, accent 
               if (!files.length) return;
               try {
                 const imgs = await Promise.all(files.map(fileToBase64));
-                onAdd(imgs);
+                onAdd(imgs.map((img) => ({ ...img, pointure: "" })));
               } catch (err) {
                 console.error(err);
               }
@@ -352,15 +316,19 @@ export default function CarnetClient() {
   const openEdit = (record) => {
     setAnalyzeError("");
     setEditingId(record.id);
+    const legacyPhotos = record.articlePhotos || (record.articlePhoto ? [record.articlePhoto] : []);
+    const photosWithPointure = legacyPhotos.map((p, idx) => ({
+      ...p,
+      pointure: p.pointure || (idx === 0 ? record.pointure || "" : ""),
+    }));
     setDraft({
       nom: record.nom || "",
       numero: record.numero || "",
       lieu: record.lieu || "",
-      pointure: record.pointure || "",
       detailsArticle: record.detailsArticle || "",
       statut: record.statut || "en_cours",
       screenshot: record.screenshot || null,
-      articlePhotos: record.articlePhotos || (record.articlePhoto ? [record.articlePhoto] : []),
+      articlePhotos: photosWithPointure,
       dateHeure: record.dateHeure ? toLocalInputValue(new Date(record.dateHeure)) : toLocalInputValue(new Date()),
     });
     setDetail(null);
@@ -383,25 +351,24 @@ export default function CarnetClient() {
         data: { text },
       } = await worker.recognize(`data:${img.mediaType};base64,${img.data}`);
 
-      const parsed = extractFieldsFromOCR(text);
-      setDraft((prev) =>
-        prev
-          ? {
-              ...prev,
-              nom: parsed.nom || prev.nom,
-              numero: parsed.numero || prev.numero,
-              lieu: parsed.lieu || prev.lieu,
-              pointure: parsed.pointure || prev.pointure,
-            }
-          : prev
-      );
-      if (!parsed.nom && !parsed.numero && !parsed.lieu && !parsed.pointure) {
+      const cleaned = cleanOcrText(text);
+      if (cleaned) {
+        setDraft((prev) =>
+          prev
+            ? {
+                ...prev,
+                detailsArticle: prev.detailsArticle
+                  ? `${prev.detailsArticle}\n---\n${cleaned}`
+                  : cleaned,
+              }
+            : prev
+        );
         setAnalyzeError(
-          "Aucune information reconnue automatiquement. Vérifie et complète les champs manuellement."
+          "Texte de la capture copié dans « Détails article » — reprends ce qu'il te faut dans les champs ci-dessous."
         );
       } else {
         setAnalyzeError(
-          "Lecture approximative (OCR local) — vérifie et corrige les champs si besoin."
+          "Aucun texte lisible dans cette capture. Renseigne les champs manuellement."
         );
       }
     } catch (err) {
@@ -424,7 +391,6 @@ export default function CarnetClient() {
     (draft.nom.trim() ||
       draft.numero.trim() ||
       draft.lieu.trim() ||
-      draft.pointure.trim() ||
       draft.detailsArticle.trim() ||
       draft.screenshot ||
       draft.articlePhotos.length > 0);
@@ -434,12 +400,16 @@ export default function CarnetClient() {
     setAnalyzeError("");
     setSaving(true);
     const id = editingId || Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    const pointures = draft.articlePhotos
+      .map((p) => (p.pointure || "").trim())
+      .filter(Boolean)
+      .join(", ");
     const lightRecord = {
       id,
       nom: draft.nom,
       numero: draft.numero,
       lieu: draft.lieu,
-      pointure: draft.pointure,
+      pointures,
       detailsArticle: draft.detailsArticle,
       statut: draft.statut,
       dateHeure: draft.dateHeure,
@@ -617,9 +587,12 @@ export default function CarnetClient() {
         .photos-field { margin-bottom: 18px; }
         .photos-field-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 8px; font-weight: 600; }
         .photos-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        .photo-thumb-wrap { display: flex; flex-direction: column; gap: 5px; }
         .photo-thumb { position: relative; aspect-ratio: 4/3; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); }
         .photo-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
         .photo-thumb-clear { position: absolute; top: 5px; right: 5px; width: 20px; height: 20px; border-radius: 50%; background: rgba(30,42,68,0.75); color: #fff; border: none; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+        .photo-pointure-input { width: 100%; box-sizing: border-box; border: 1.5px solid var(--line-strong); border-radius: 7px; padding: 5px 6px; font-size: 12px; text-align: center; font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--ink); }
+        .photo-pointure-input:focus { outline: none; border-color: var(--ink); }
         .photo-add-tile { aspect-ratio: 4/3; border: 1.5px dashed var(--line-strong); border-radius: 10px; background: #FBFAF5; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; cursor: pointer; color: var(--ink-soft); position: relative; overflow: hidden; text-align: center; padding: 6px; transition: border-color 0.15s ease; }
         .photo-add-tile:hover { border-color: var(--label-red); }
         .photo-add-tile span { font-size: 10.5px; font-weight: 500; line-height: 1.3; }
@@ -698,7 +671,10 @@ export default function CarnetClient() {
         .modal-head h2 { font-size: 18px; margin: 0 0 4px; font-weight: 700; }
         .modal-sub { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 800; color: var(--ink); }
         .modal-imgs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 0; }
+        .modal-imgs.modal-imgs-single { grid-template-columns: 1fr; }
         .modal-imgs img { width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: 10px; border: 1px solid var(--line); }
+        .modal-photo-item { display: flex; flex-direction: column; gap: 5px; }
+        .modal-photo-pointure { text-align: center; font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 12.5px; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 7px; padding: 4px 6px; }
         .modal-fields { display: flex; flex-direction: column; gap: 9px; margin: 14px 0; }
         .modal-fields .row { display: flex; justify-content: space-between; gap: 12px; font-size: 13.5px; padding: 8px 0; border-bottom: 1px solid var(--line); }
         .modal-fields .row b { color: var(--ink-soft); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; font-family: 'JetBrains Mono', monospace; }
@@ -785,6 +761,14 @@ export default function CarnetClient() {
                   articlePhotos: p.articlePhotos.filter((_, i) => i !== idx),
                 }))
               }
+              onPointureChange={(idx, value) =>
+                setDraft((p) => ({
+                  ...p,
+                  articlePhotos: p.articlePhotos.map((img, i) =>
+                    i === idx ? { ...img, pointure: value } : img
+                  ),
+                }))
+              }
             />
 
             {analyzing && (
@@ -825,24 +809,13 @@ export default function CarnetClient() {
               />
             </div>
 
-            <div className="field-row">
-              <div className="field">
-                <label>Pointure</label>
-                <input
-                  type="text"
-                  placeholder="Ex : 42"
-                  value={draft.pointure}
-                  onChange={(e) => setDraft((p) => ({ ...p, pointure: e.target.value }))}
-                />
-              </div>
-              <div className="field">
-                <label>Date &amp; heure</label>
-                <input
-                  type="datetime-local"
-                  value={draft.dateHeure}
-                  onChange={(e) => setDraft((p) => ({ ...p, dateHeure: e.target.value }))}
-                />
-              </div>
+            <div className="field">
+              <label>Date &amp; heure</label>
+              <input
+                type="datetime-local"
+                value={draft.dateHeure}
+                onChange={(e) => setDraft((p) => ({ ...p, dateHeure: e.target.value }))}
+              />
             </div>
 
             <div className="field">
@@ -947,9 +920,10 @@ export default function CarnetClient() {
                         <b>Lieu</b> <span className="card-meta-value">{entry.lieu}</span>
                       </span>
                     )}
-                    {entry.pointure && (
+                    {entry.pointures && (
                       <span>
-                        <b>Pointure</b> <span className="card-meta-value">{entry.pointure}</span>
+                        <b>Pointure{entry.pointures.includes(",") ? "s" : ""}</b>{" "}
+                        <span className="card-meta-value">{entry.pointures}</span>
                       </span>
                     )}
                   </div>
@@ -1015,23 +989,31 @@ export default function CarnetClient() {
                     detail.record.articlePhotos ||
                     (detail.record.articlePhoto ? [detail.record.articlePhoto] : []);
                   return (
-                    (detail.record.screenshot || photos.length > 0) && (
-                      <div className="modal-imgs">
-                        {detail.record.screenshot && (
+                    <>
+                      {detail.record.screenshot && (
+                        <div className="modal-imgs modal-imgs-single">
                           <img
                             src={`data:${detail.record.screenshot.mediaType};base64,${detail.record.screenshot.data}`}
                             alt="Capture"
                           />
-                        )}
-                        {photos.map((img, idx) => (
-                          <img
-                            key={idx}
-                            src={`data:${img.mediaType};base64,${img.data}`}
-                            alt={`Article ${idx + 1}`}
-                          />
-                        ))}
-                      </div>
-                    )
+                        </div>
+                      )}
+                      {photos.length > 0 && (
+                        <div className="modal-imgs">
+                          {photos.map((img, idx) => (
+                            <div className="modal-photo-item" key={idx}>
+                              <img
+                                src={`data:${img.mediaType};base64,${img.data}`}
+                                alt={`Article ${idx + 1}`}
+                              />
+                              {img.pointure && (
+                                <div className="modal-photo-pointure">Pointure {img.pointure}</div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
                   );
                 })()}
 
@@ -1039,10 +1021,6 @@ export default function CarnetClient() {
                   <div className="row">
                     <b>Lieu</b>
                     <span className="value-strong">{detail.record.lieu || "—"}</span>
-                  </div>
-                  <div className="row">
-                    <b>Pointure</b>
-                    <span className="value-strong">{detail.record.pointure || "—"}</span>
                   </div>
                   {detail.record.detailsArticle && (
                     <div className="row">

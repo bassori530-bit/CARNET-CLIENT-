@@ -1,4 +1,4 @@
-const CACHE_NAME = "carnet-client-v3";
+const CACHE_NAME = "carnet-client-v5";
 const APP_SHELL = [
   "./",
   "./index.html",
