@@ -15,9 +15,8 @@ import {
   CheckCircle2,
   CircleDot,
   Pencil,
-  Settings,
-  KeyRound,
 } from "lucide-react";
+import { createWorker } from "tesseract.js";
 
 // ---------------------------------------------------------------------------
 // Carnet Client — registre de clients (chaussures) conçu pour tenir un très
@@ -83,6 +82,64 @@ function safeParse(json, fallback) {
   } catch {
     return fallback;
   }
+}
+
+// Extraction approximative des champs à partir du texte brut lu par l'OCR.
+// Basée sur des mots-clés courants ; à vérifier/corriger manuellement.
+function extractFieldsFromOCR(rawText) {
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const joined = rawText.replace(/\s+/g, " ");
+
+  const findAfterLabel = (labelPatterns) => {
+    for (const pattern of labelPatterns) {
+      const re = new RegExp(pattern + "\\s*[:\\-]?\\s*(.+)", "i");
+      for (const line of lines) {
+        const m = line.match(re);
+        if (m && m[1] && m[1].trim().length > 1) return m[1].trim();
+      }
+    }
+    return "";
+  };
+
+  const nom = findAfterLabel(["client", "destinataire", "nom du client", "nom", "livr[ée] [àa]"]);
+
+  let numero = findAfterLabel([
+    "n[°o]\\s*de commande",
+    "commande n[°o]",
+    "num[ée]ro de suivi",
+    "num[ée]ro de commande",
+    "num[ée]ro de colis",
+    "tracking",
+    "colis n[°o]",
+    "cmd",
+    "num[ée]ro",
+  ]);
+  if (!numero) {
+    const m = joined.match(/\b([A-Z]{2,}-?\d{4,}|\d{6,})\b/);
+    if (m) numero = m[1];
+  }
+
+  const lieu = findAfterLabel([
+    "lieu de livraison",
+    "adresse de livraison",
+    "livraison [àa]",
+    "exp[ée]di[ée] [àa]",
+    "adresse",
+    "ville",
+    "destination",
+    "lieu",
+  ]);
+
+  let pointure = findAfterLabel(["pointure", "taille", "size", "eu\\s*size"]);
+  if (!pointure) {
+    const m = joined.match(/\b(3[4-9]|4[0-8])\b/);
+    if (m) pointure = m[1];
+  }
+
+  return { nom, numero, lieu, pointure };
 }
 
 function UploadTile({ label, hint, icon: Icon, image, onPick, onClear, accent }) {
@@ -197,13 +254,11 @@ export default function CarnetClient() {
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [confirmingId, setConfirmingId] = useState(null);
   const [detail, setDetail] = useState(null); // {loading, record, id}
-  const [apiKey, setApiKey] = useState("");
-  const [apiKeyDraft, setApiKeyDraft] = useState("");
-  const [showSettings, setShowSettings] = useState(false);
 
   const chunkMapRef = useRef({}); // id -> chunk index
   const metaRef = useRef({ chunkCount: 0 });
   const confirmTimerRef = useRef(null);
+  const ocrWorkerRef = useRef(null);
 
   // -- Chargement initial de l'index (par blocs) ---------------------------
   useEffect(() => {
@@ -246,35 +301,15 @@ export default function CarnetClient() {
     })();
   }, []);
 
-  // -- Chargement de la clé API personnelle (stockée sur l'appareil) -------
+  // -- Worker OCR (Tesseract.js) : créé une seule fois, réutilisé -----------
   useEffect(() => {
-    (async () => {
-      try {
-        const res = await window.storage.get("settings-anthropic-key", false);
-        if (res && res.value) {
-          setApiKey(res.value);
-          setApiKeyDraft(res.value);
-        }
-      } catch {
-        // pas de clé enregistrée
+    return () => {
+      if (ocrWorkerRef.current) {
+        ocrWorkerRef.current.terminate().catch(() => {});
+        ocrWorkerRef.current = null;
       }
-    })();
+    };
   }, []);
-
-  const saveApiKey = async () => {
-    const trimmed = apiKeyDraft.trim();
-    setApiKey(trimmed);
-    try {
-      if (trimmed) {
-        await window.storage.set("settings-anthropic-key", trimmed, false);
-      } else {
-        await window.storage.delete("settings-anthropic-key", false);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-    setShowSettings(false);
-  };
 
   // -- Helpers de stockage par blocs ---------------------------------------
   const persistNewIndexRecord = async (record) => {
@@ -337,63 +372,18 @@ export default function CarnetClient() {
   };
 
   const analyzeScreenshot = useCallback(async (img) => {
-    if (!apiKey) {
-      setAnalyzeError(
-        "Aucune clé API configurée. Ouvre les réglages (icône ⚙ en haut) pour l'ajouter, ou renseigne les champs manuellement."
-      );
-      return;
-    }
     setAnalyzing(true);
     setAnalyzeError("");
     try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
-        },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
-          system:
-            "Tu extrais des informations depuis une capture d'écran d'une commande ou d'une étiquette d'expédition de chaussures. " +
-            "Réponds UNIQUEMENT avec un objet JSON valide, sans texte autour, sans balises markdown, au format exact : " +
-            '{"nom": "...", "numero": "...", "lieu": "...", "pointure": "..."}. ' +
-            "nom = nom du client/destinataire si visible (chaîne, vide si absent). " +
-            "numero = numéro de commande, de suivi ou de colis visible sur l'image (chaîne, vide si absent). " +
-            "lieu = lieu ou adresse de livraison / expédition (ville, pays ou adresse courte, vide si absent). " +
-            "pointure = pointure de la chaussure si elle est visible (ex: '42', vide si absente). " +
-            "Si une information est introuvable, mets une chaîne vide pour ce champ.",
-          messages: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "image",
-                  source: { type: "base64", media_type: img.mediaType, data: img.data },
-                },
-                {
-                  type: "text",
-                  text: "Extrais le nom du client, le numéro, le lieu de livraison/expédition et la pointure depuis cette capture.",
-                },
-              ],
-            },
-          ],
-        }),
-      });
-      if (!response.ok) {
-        const errBody = await response.json().catch(() => null);
-        const msg = errBody?.error?.message || `Erreur API (${response.status})`;
-        throw new Error(msg);
+      if (!ocrWorkerRef.current) {
+        ocrWorkerRef.current = await createWorker("fra");
       }
-      const data = await response.json();
-      const text = (data.content || [])
-        .map((b) => (b.type === "text" ? b.text : ""))
-        .join("\n")
-        .trim();
-      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const worker = ocrWorkerRef.current;
+      const {
+        data: { text },
+      } = await worker.recognize(`data:${img.mediaType};base64,${img.data}`);
+
+      const parsed = extractFieldsFromOCR(text);
       setDraft((prev) =>
         prev
           ? {
@@ -405,15 +395,24 @@ export default function CarnetClient() {
             }
           : prev
       );
+      if (!parsed.nom && !parsed.numero && !parsed.lieu && !parsed.pointure) {
+        setAnalyzeError(
+          "Aucune information reconnue automatiquement. Vérifie et complète les champs manuellement."
+        );
+      } else {
+        setAnalyzeError(
+          "Lecture approximative (OCR local) — vérifie et corrige les champs si besoin."
+        );
+      }
     } catch (err) {
       console.error(err);
       setAnalyzeError(
-        `Analyse impossible (${err.message || "erreur inconnue"}). Renseigne les champs manuellement ci-dessous.`
+        "Lecture automatique impossible. Renseigne les champs manuellement ci-dessous."
       );
     } finally {
       setAnalyzing(false);
     }
-  }, [apiKey]);
+  }, []);
 
   const handleScreenshotPick = (img) => {
     setDraft((prev) => ({ ...prev, screenshot: img }));
@@ -589,9 +588,6 @@ export default function CarnetClient() {
         .brand-title { font-size: 21px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
         .new-btn { display: flex; align-items: center; gap: 6px; background: var(--ink); color: var(--paper); border: none; border-radius: 10px; padding: 10px 14px; font-weight: 600; font-size: 13.5px; cursor: pointer; transition: transform 0.12s ease, background 0.15s ease; flex-shrink: 0; }
         .new-btn:hover { background: #14203a; } .new-btn:active { transform: scale(0.96); }
-        .topbar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-        .settings-btn { display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 10px; border: 1.5px solid var(--line-strong); background: #fff; color: var(--ink-soft); cursor: pointer; flex-shrink: 0; }
-        .settings-btn:hover { background: rgba(30,42,68,0.05); color: var(--ink); }
         .content { max-width: 600px; margin: 0 auto; padding: 20px; }
 
         .panel { background: var(--paper-raised); border: 1px solid var(--line); border-radius: 16px; padding: 20px; margin-bottom: 28px; box-shadow: 0 1px 2px rgba(30,42,68,0.04), 0 8px 24px -12px rgba(30,42,68,0.12); animation: rise 0.22s ease; }
@@ -701,8 +697,6 @@ export default function CarnetClient() {
         .modal-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; gap: 10px; }
         .modal-head h2 { font-size: 18px; margin: 0 0 4px; font-weight: 700; }
         .modal-sub { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 800; color: var(--ink); }
-        .modal-sub-plain { font-size: 12.5px; color: var(--ink-soft); }
-        .settings-hint { font-size: 12px; color: var(--ink-soft); line-height: 1.5; margin: 2px 0 4px; }
         .modal-imgs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 0; }
         .modal-imgs img { width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: 10px; border: 1px solid var(--line); }
         .modal-fields { display: flex; flex-direction: column; gap: 9px; margin: 14px 0; }
@@ -729,22 +723,10 @@ export default function CarnetClient() {
             <h1 className="brand-title">Carnet Client</h1>
           </div>
           {!draft && (
-            <div className="topbar-actions">
-              <button
-                className="settings-btn"
-                onClick={() => {
-                  setApiKeyDraft(apiKey);
-                  setShowSettings(true);
-                }}
-                aria-label="Réglages"
-              >
-                <Settings size={17} strokeWidth={2} />
-              </button>
-              <button className="new-btn" onClick={openNew}>
-                <Plus size={16} strokeWidth={2.4} />
-                Créer
-              </button>
-            </div>
+            <button className="new-btn" onClick={openNew}>
+              <Plus size={16} strokeWidth={2.4} />
+              Créer
+            </button>
           )}
         </div>
       </header>
@@ -779,7 +761,7 @@ export default function CarnetClient() {
             <div className="uploads-row">
               <UploadTile
                 label="Capture d'écran"
-                hint="Importer la capture (analyse auto)"
+                hint="Importer la capture (lecture auto approximative)"
                 icon={Sparkles}
                 image={draft.screenshot}
                 accent="#C1440E"
@@ -1106,52 +1088,6 @@ export default function CarnetClient() {
                 </div>
               </>
             )}
-          </div>
-        </div>
-      )}
-
-      {showSettings && (
-        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <div>
-                <h2>Réglages</h2>
-                <div className="modal-sub-plain">Analyse automatique des captures</div>
-              </div>
-              <button className="panel-close" onClick={() => setShowSettings(false)} aria-label="Fermer">
-                <X size={18} />
-              </button>
-            </div>
-
-            <div className="field mono">
-              <label>
-                <KeyRound size={12} style={{ verticalAlign: "-2px", marginRight: 4 }} />
-                Clé API Anthropic
-              </label>
-              <input
-                type="password"
-                placeholder="sk-ant-..."
-                value={apiKeyDraft}
-                onChange={(e) => setApiKeyDraft(e.target.value)}
-                autoComplete="off"
-              />
-            </div>
-            <p className="settings-hint">
-              Nécessaire pour que le bouton « Capture d'écran » remplisse automatiquement les
-              champs. La clé est enregistrée uniquement sur cet appareil et n'est jamais envoyée
-              ailleurs qu'à l'API Anthropic. Laisse le champ vide pour désactiver l'analyse
-              automatique.
-            </p>
-
-            <div className="panel-actions">
-              <button className="btn-cancel" onClick={() => setShowSettings(false)}>
-                Annuler
-              </button>
-              <button className="btn-save" onClick={saveApiKey}>
-                <Save size={15} strokeWidth={2.2} />
-                Enregistrer
-              </button>
-            </div>
           </div>
         </div>
       )}
